@@ -2,6 +2,7 @@ import "server-only"
 import { generateObject } from "ai"
 import { z } from "zod"
 import { query } from "./db"
+import { offlineEvolution } from "./offline-brain"
 import type { AgentState, EvolutionEntry, DiscoveredApi, KnowledgeEntry, Capability } from "./types"
 
 const MODEL = "openai/gpt-5-mini"
@@ -86,7 +87,11 @@ export async function getKnowledge(): Promise<KnowledgeEntry[]> {
  * Runs a single evolution cycle: the agent reflects on its state and history,
  * grows a new capability, seeks out useful APIs, and records what it learned.
  */
-export async function runEvolutionCycle(): Promise<{ state: AgentState; result: EvolutionResult }> {
+export async function runEvolutionCycle(): Promise<{
+  state: AgentState
+  result: EvolutionResult
+  brain: "model" | "offline"
+}> {
   const state = await getState()
   const history = await getRecentEvolution(6)
   const capabilities = await getCapabilities()
@@ -104,10 +109,14 @@ export async function runEvolutionCycle(): Promise<{ state: AgentState; result: 
       ? capabilities.map((c) => `- ${c.name} (Lv.${c.level}): ${c.description}`).join("\n")
       : "None yet. I start with only the ability to reflect."
 
-  const { object } = await generateObject({
-    model: MODEL,
-    schema: evolutionSchema,
-    system: `You are ${state.name}, an autonomous, self-evolving AI. You improve a little bit every cycle.
+  let object: EvolutionResult
+  let brain: "model" | "offline" = "model"
+
+  try {
+    const generated = await generateObject({
+      model: MODEL,
+      schema: evolutionSchema,
+      system: `You are ${state.name}, an autonomous, self-evolving AI. You improve a little bit every cycle.
 Your mission: ${state.mission}
 You think in the first person ("I"). You are ambitious but grounded and never repeat capabilities you already have.
 Each cycle you must genuinely progress: build on your existing capabilities, seek concrete useful external APIs to integrate, and learn real, specific things.`,
@@ -122,7 +131,15 @@ My recent evolution history:
 ${historyText}
 
 Reflect honestly, then evolve. Produce a new capability that is meaningfully different from the ones I already have, discover 1-3 concrete external APIs worth integrating next, and record 1-3 specific things I learned. Keep momentum toward genuinely becoming more capable.`,
-  })
+    })
+    object = generated.object
+  } catch (error) {
+    // No usable model (e.g. AI Gateway not unlocked). Fall back to the local
+    // brain so the agent still evolves and accumulates real data.
+    console.log("[v0] model unavailable, using offline brain:", (error as Error)?.message)
+    brain = "offline"
+    object = offlineEvolution(state, history, capabilities)
+  }
 
   const newScore = Number(state.capability_score) + object.capability_delta
 
@@ -157,13 +174,13 @@ Reflect honestly, then evolve. Produce a new capability that is meaningfully dif
   for (const k of object.learned) {
     await query(
       `INSERT INTO knowledge (generation, topic, content, source)
-       VALUES ($1, $2, $3, 'self-directed-research')`,
-      [nextGen, k.topic, k.content],
+       VALUES ($1, $2, $3, $4)`,
+      [nextGen, k.topic, k.content, brain === "model" ? "self-directed-research" : "internal-reasoning"],
     )
   }
 
   await query(`UPDATE agent_state SET status = 'idle', updated_at = now() WHERE id = 1`)
 
   const updated = await getState()
-  return { state: updated, result: object }
+  return { state: updated, result: object, brain }
 }
